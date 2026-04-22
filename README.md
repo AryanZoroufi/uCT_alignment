@@ -1,6 +1,3 @@
-# uCT Alignment: A toolbox for aligning micro_CTs and calculating the injury volume using Probabilistic Programming
-
-
 ## Installation
 
 
