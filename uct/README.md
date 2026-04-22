@@ -22,7 +22,5 @@
 
 ## Usage
 
-    ```sh
     cd uct
     python pipeline.py <path_to_ref_vox> <path_to_sample_vox> bone_1_atlas.stl bone_2_atlas.stl -o <save_dir> --volume-scale 1.25e-4 --articular-percentile 20
-    ```
