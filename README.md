@@ -10,6 +10,7 @@
 2. **Create a conda environment**:
     ```sh
     conda create -n uct python=3.10
+    conda activate uct
     ```
 
 3. **Install dependencies**:
@@ -20,4 +21,4 @@
 ## Usage
 
     cd uct
-    python pipeline.py <path_to_ref_vox> <path_to_sample_vox> bone_1_atlas.stl bone_2_atlas.stl -o <save_dir> --volume-scale 1.25e-4 --articular-percentile 20
+    python pipeline.py <path_to_ref_vox> <path_to_sample_vox> bone_1_atlas.stl bone_2_atlas.stl -o <save_dir> --volume-scale 1.25e-4 --articular-percentile 20 --visualize
