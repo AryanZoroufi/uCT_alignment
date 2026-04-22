@@ -1,0 +1,13 @@
+numpy~=2.2.6
+scipy~=1.15.3
+scikit-image~=0.25.2
+numpy-stl~=3.2.0
+trimesh~=4.11.5
+fast-simplification~=0.1.13
+alphashape~=1.3.1
+matplotlib~=3.10.8
+rerun-sdk~=0.31.3
+networkx~=3.4.2
+rtree~=1.4.1
+jax[cuda12]~=0.4.38
+genjax==0.8.2.dev1
