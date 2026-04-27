@@ -93,6 +93,45 @@ def _canonical_axes(verts_centred: np.ndarray, axes: np.ndarray) -> np.ndarray:
 
 
 # ---------------------------------------------------------------------------
+# Pre-alignment: orient longest PCA axis onto +X
+# ---------------------------------------------------------------------------
+
+def align_longest_axis_to_x(mesh: trimesh.Trimesh) -> trimesh.Trimesh:
+    """
+    Rotate mesh so its longest PCA axis aligns with the +X axis.
+
+    The sign of the new X axis is fixed by skewness (same convention as
+    _canonical_axes) so the orientation is deterministic across scans.
+    The rotation is applied about the mesh centroid so the bone stays in
+    roughly the same position in space.  Returns a new Trimesh (copy).
+    """
+    centroid = _area_weighted_centroid(mesh)
+    axes, _ = _pca_axes(mesh, centroid)   # axes[0] = longest axis
+
+    # Canonicalise sign of longest axis via skewness
+    verts_c = mesh.vertices - centroid
+    proj = verts_c @ axes[0]
+    skewness = float(np.mean(proj ** 3)) / (float(np.std(proj)) ** 3 + 1e-10)
+    if skewness < 0:
+        axes[0] *= -1
+
+    # Ensure proper rotation (det = +1)
+    if np.linalg.det(axes) < 0:
+        axes[2] *= -1
+
+    # R = axes maps each PCA axis → corresponding standard basis vector,
+    # so after the transform axes[0] → [1,0,0].
+    R = axes
+    T = np.eye(4)
+    T[:3, :3] = R
+    T[:3,  3] = centroid - R @ centroid
+
+    result = mesh.copy()
+    result.apply_transform(T)
+    return result
+
+
+# ---------------------------------------------------------------------------
 # In-memory alignment (trimesh objects in, trimesh object out)
 # ---------------------------------------------------------------------------
 

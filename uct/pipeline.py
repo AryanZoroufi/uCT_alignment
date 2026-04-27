@@ -43,9 +43,10 @@ from scipy.optimize import linear_sum_assignment
 from scipy.spatial.distance import cdist
 
 sys.path.insert(0, str(Path(__file__).parent))
-from vox_to_stl   import vox_to_stl
-from align_mesh   import align_mesh
-from smc_align    import smc_align_aggregate, smc_align, smc_align_per_bone
+from vox_to_stl    import vox_to_stl
+from align_mesh    import align_mesh, align_longest_axis_to_x
+from smc_align     import smc_align_aggregate, smc_align, smc_align_per_bone
+from segment_mesh  import split_bone_xslice, split_thin_bridge
 
 
 
@@ -334,10 +335,23 @@ def run_pipeline(
     )
 
     print(f"\n[ref] {ref_vox.name}")
-    vox_to_stl(str(ref_vox), str(ref_stl), **mesh_kwargs)
+    ref_voxel_size = vox_to_stl(str(ref_vox), str(ref_stl), **mesh_kwargs)
 
     print(f"\n[sample] {sample_vox.name}")
-    vox_to_stl(str(sample_vox), str(sample_stl), **mesh_kwargs)
+    sample_voxel_size = vox_to_stl(str(sample_vox), str(sample_stl), **mesh_kwargs)
+
+    # ------------------------------------------------------------------ 1b
+    print("\n" + "=" * 60)
+    print("STEP 1b   Orient meshes: longest PCA axis → X")
+    print("=" * 60)
+
+    for label, path in [("ref", ref_stl), ("sample", sample_stl)]:
+        print(f"\n[{label}] {path.name}")
+        m = trimesh.load(str(path), force="mesh", process=False)
+        m.merge_vertices()
+        m = align_longest_axis_to_x(m)
+        m.export(str(path))
+        print(f"  Longest axis → X  ({path.name} updated)")
 
     # ------------------------------------------------------------------ 2/5
     print("\n" + "=" * 60)
@@ -359,6 +373,36 @@ def run_pipeline(
 
     print(f"\n[sample]")
     sample_segs = _split_mesh(sample_aligned_stl, MIN_FACES)
+
+    # ------------------------------------------------------------------ 3b
+    print("\n" + "=" * 60)
+    print("STEP 3b   Split thin-bridge components  (EDT erosion)")
+    print("=" * 60)
+    print("\n  Criteria: bridge < 5% of total volume  AND"
+          "  smaller piece > 20% of larger piece.\n")
+
+    def _apply_thin_bridge_splits(
+        segs: list[trimesh.Trimesh],
+        voxel_size: float,
+        label: str,
+    ) -> list[trimesh.Trimesh]:
+        result = []
+        for i, seg in enumerate(segs):
+            print(f"  [{label}] segment {i+1}  ({len(seg.faces):,} faces) ...", end=" ")
+            pair = split_thin_bridge(seg, voxel_size)
+            if pair is not None:
+                a, b = pair
+                print(f"split → {len(a.faces):,} + {len(b.faces):,} faces")
+                result.extend([a, b])
+            else:
+                print("no split")
+                result.append(seg)
+        return result
+
+    print("[ref]")
+    ref_segs    = _apply_thin_bridge_splits(ref_segs,    ref_voxel_size,    "ref")
+    print("\n[sample]")
+    sample_segs = _apply_thin_bridge_splits(sample_segs, sample_voxel_size, "sample")
 
     # ------------------------------------------------------------------ 4/5
     print("\n" + "=" * 60)

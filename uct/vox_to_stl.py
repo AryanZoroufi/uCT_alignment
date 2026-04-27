@@ -249,6 +249,7 @@ def vox_to_stl(
         _save_stl(st_verts, st_faces, soft_tissue_stl)
 
     print("\nDone.")
+    return voxel_size_mm
 
 
 # ---------------------------------------------------------------------------
