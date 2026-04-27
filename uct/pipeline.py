@@ -375,34 +375,35 @@ def run_pipeline(
     sample_segs = _split_mesh(sample_aligned_stl, MIN_FACES)
 
     # ------------------------------------------------------------------ 3b
-    print("\n" + "=" * 60)
-    print("STEP 3b   Split thin-bridge components  (EDT erosion)")
-    print("=" * 60)
-    print("\n  Criteria: bridge < 5% of total volume  AND"
-          "  smaller piece > 20% of larger piece.\n")
-
-    def _apply_thin_bridge_splits(
-        segs: list[trimesh.Trimesh],
-        voxel_size: float,
-        label: str,
-    ) -> list[trimesh.Trimesh]:
-        result = []
-        for i, seg in enumerate(segs):
-            print(f"  [{label}] segment {i+1}  ({len(seg.faces):,} faces) ...", end=" ")
-            pair = split_thin_bridge(seg, voxel_size)
-            if pair is not None:
-                a, b = pair
-                print(f"split → {len(a.faces):,} + {len(b.faces):,} faces")
-                result.extend([a, b])
-            else:
-                print("no split")
-                result.append(seg)
-        return result
-
-    print("[ref]")
-    ref_segs    = _apply_thin_bridge_splits(ref_segs,    ref_voxel_size,    "ref")
-    print("\n[sample]")
-    sample_segs = _apply_thin_bridge_splits(sample_segs, sample_voxel_size, "sample")
+    # COMMENTED OUT: thin-bridge splitting via EDT erosion
+    # print("\n" + "=" * 60)
+    # print("STEP 3b   Split thin-bridge components  (EDT erosion)")
+    # print("=" * 60)
+    # print("\n  Criteria: bridge < 5% of total volume  AND"
+    #       "  smaller piece > 20% of larger piece.\n")
+    #
+    # def _apply_thin_bridge_splits(
+    #     segs: list[trimesh.Trimesh],
+    #     voxel_size: float,
+    #     label: str,
+    # ) -> list[trimesh.Trimesh]:
+    #     result = []
+    #     for i, seg in enumerate(segs):
+    #         print(f"  [{label}] segment {i+1}  ({len(seg.faces):,} faces) ...", end=" ")
+    #         pair = split_thin_bridge(seg, voxel_size)
+    #         if pair is not None:
+    #             a, b = pair
+    #             print(f"split → {len(a.faces):,} + {len(b.faces):,} faces")
+    #             result.extend([a, b])
+    #         else:
+    #             print("no split")
+    #             result.append(seg)
+    #     return result
+    #
+    # print("[ref]")
+    # ref_segs    = _apply_thin_bridge_splits(ref_segs,    ref_voxel_size,    "ref")
+    # print("\n[sample]")
+    # sample_segs = _apply_thin_bridge_splits(sample_segs, sample_voxel_size, "sample")
 
     # ------------------------------------------------------------------ 4/5
     print("\n" + "=" * 60)

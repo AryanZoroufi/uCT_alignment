@@ -1,0 +1,17 @@
+# articular surface distance method (area-weighted)
+# positive = bone grew into joint in sample
+
+articular_percentile:           10.0
+volume_scale:                   0.000125
+
+ref_area_weighted_dist:         7.421999
+sample_area_weighted_dist:      7.801678
+ref_articular_volume:           8496.114992
+sample_articular_volume:        8390.411593
+ref_bone2_length:               28.441535
+sample_bone2_length:            27.800049
+ref_dist_normalized:            0.260956
+sample_dist_normalized:         0.280635
+
+injection_volume_raw:           +0.013213  # (ref - sample) articular vol × scale
+injection_score_normalized:     -0.019679  # dimensionless distance ratio
