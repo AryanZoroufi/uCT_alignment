@@ -182,6 +182,69 @@ def align_trimesh(
     return aligned
 
 
+def aggregate_align_transform(
+    ref_meshes:   list[trimesh.Trimesh],
+    sample_meshes: list[trimesh.Trimesh],
+    use_icp: bool = True,
+    icp_max_iter: int = 80,
+    icp_samples: int = 10_000,
+) -> np.ndarray:
+    """
+    Concatenate all ref bones and all sample bones into two aggregates,
+    run PCA + ICP on the aggregates, and return the single 4x4 transform.
+
+    Apply the returned matrix to each individual sample bone to coarsely
+    pre-align the whole set while preserving inter-bone structure.
+    """
+    ref_agg    = trimesh.util.concatenate(ref_meshes)
+    sample_agg = trimesh.util.concatenate(sample_meshes)
+    ref_agg.merge_vertices()
+    sample_agg.merge_vertices()
+
+    print(f"  Aggregate ref:    {len(ref_agg.vertices):,} verts")
+    print(f"  Aggregate sample: {len(sample_agg.vertices):,} verts")
+
+    ref_centroid    = _area_weighted_centroid(ref_agg)
+    sample_centroid = _area_weighted_centroid(sample_agg)
+
+    ref_axes,    ref_stddevs    = _pca_axes(ref_agg,    ref_centroid)
+    sample_axes, sample_stddevs = _pca_axes(sample_agg, sample_centroid)
+
+    uniform_scale = ref_stddevs.mean() / sample_stddevs.mean()
+    print(f"  Uniform scale: {uniform_scale:.6f}")
+
+    ref_canon    = _canonical_axes(ref_agg.vertices    - ref_centroid,    ref_axes)
+    sample_canon = _canonical_axes(sample_agg.vertices - sample_centroid, sample_axes)
+
+    R = ref_canon.T @ sample_canon
+
+    T_pca = np.eye(4)
+    T_pca[:3, :3] = R * uniform_scale
+    T_pca[:3,  3] = ref_centroid - R @ (sample_centroid * uniform_scale)
+
+    if not use_icp:
+        print(f"  PCA-only transform computed (no ICP).")
+        return T_pca
+
+    aligned_agg = sample_agg.copy()
+    aligned_agg.apply_transform(T_pca)
+
+    rng = np.random.default_rng(0)
+    n_ref  = min(icp_samples, len(ref_agg.vertices))
+    n_samp = min(icp_samples, len(aligned_agg.vertices))
+    ref_pts    = ref_agg.vertices[rng.choice(len(ref_agg.vertices),     n_ref,  replace=False)]
+    sample_pts = aligned_agg.vertices[rng.choice(len(aligned_agg.vertices), n_samp, replace=False)]
+
+    T_icp, _, cost = trimesh.registration.icp(
+        sample_pts, ref_pts,
+        max_iterations=icp_max_iter, threshold=1e-6,
+        reflection=False, scale=False,
+    )
+    print(f"  ICP final cost: {cost:.6f}")
+
+    return T_icp @ T_pca
+
+
 # ---------------------------------------------------------------------------
 # File-based alignment (reads STL files, saves result to disk)
 # ---------------------------------------------------------------------------
