@@ -49,6 +49,9 @@ from segment_mesh  import split_bone_xslice, split_thin_bridge
 def _segment_via_atlas(
     stl_path: Path,
     atlas_path: Path,
+    return_transform: bool = False,
+    debug_dir=None,
+    registration: str = "icp",
 ) -> dict[int, trimesh.Trimesh]:
     """
     Atlas-based segmentation (ported from apply_atlas.py).
@@ -152,6 +155,19 @@ def _segment_via_atlas(
     N_boundary = N_solid & ~binary_erosion(N_solid, structure=struct)
     N_surf = np.argwhere(N_boundary).astype(np.float32) * A_pitch + N_origin
 
+    # ---------- Optional: chamfer-selected 7-DOF registration ----------
+    # Replaces the PCA + ICP-residual selection + IoU-SMC below with a
+    # chamfer-selected, mirror-correct 7-DOF fit (see atlas_register.py). The
+    # PCA/ICP still run (cheap, unused) and the IoU-SMC is skipped; A_total is
+    # overridden at the composition step. Arrays stay un-mirrored (mirror is in
+    # the transform).
+    _chamfer_A_total = None
+    if registration == "chamfer":
+        from atlas_register import register_atlas_7dof_chamfer
+        _chamfer_A_total, _cinfo = register_atlas_7dof_chamfer(A_surf, N_surf)
+        print(f"  chamfer 7-DOF: chamfer={_cinfo['chamfer']:.3f}mm  "
+              f"scale={_cinfo['scale']:.4f}  mirror={_cinfo['mirror']}")
+
     # ---------- STAGE 1: PCA coarse alignment ----------
     print("  stage 1: PCA coarse alignment")
     def pca_basis(pts):
@@ -189,6 +205,8 @@ def _segment_via_atlas(
                     best = (score, R, t, mirror_flag)
     score0, R0, t0, mirror_used = best
     print(f"    best: {score0:.2f}mm ({'MIRROR' if mirror_used else 'normal'} atlas)")
+    if registration == "chamfer":
+        mirror_used = False   # mirror lives in the chamfer transform; keep arrays original
 
     if mirror_used:
         A_sub_for_icp = A_sub.copy()
@@ -285,12 +303,13 @@ def _segment_via_atlas(
 
     smc_params = smc_mirror_axis = None
     try:
-        from smc_align import _run_is
-        smc_params, smc_iou, smc_baseline, smc_mirror_axis = _run_is(
-            ref_mesh=scan_mesh_smc, sample_mesh=atlas_mesh_smc,
-            seed=0, n_restarts=3,
-        )
-        print(f"    SMC IoU: {smc_iou:.4f}  (baseline {smc_baseline:.4f})")
+        if registration != "chamfer":
+            from smc_align import _run_is
+            smc_params, smc_iou, smc_baseline, smc_mirror_axis = _run_is(
+                ref_mesh=scan_mesh_smc, sample_mesh=atlas_mesh_smc,
+                seed=0, n_restarts=3,
+            )
+            print(f"    SMC IoU: {smc_iou:.4f}  (baseline {smc_baseline:.4f})")
     except Exception as e:
         print(f"    SMC failed: {type(e).__name__}: {e} — continuing with ICP only")
 
@@ -340,6 +359,8 @@ def _segment_via_atlas(
         if smc_mirror_axis is not None:
             A_total = _smc_mirror_4x4(smc_atlas_centroid, smc_mirror_axis) @ A_total
         A_total = _smc_transform_4x4(smc_atlas_centroid, smc_params) @ A_total
+    if _chamfer_A_total is not None:
+        A_total = _chamfer_A_total               # chamfer-selected 7-DOF overrides
 
     A_inv = np.linalg.inv(A_total)               # scan→atlas (SITK convention)
     M_inv = A_inv[:3, :3]
@@ -379,6 +400,31 @@ def _segment_via_atlas(
     )
     N_lbl = sitk_to_np(resampled).astype(np.uint8)
     N_lbl[~N_solid] = 0
+
+    # ---- DEBUG: dump the atlas template + aligned scan surface (scan-physical
+    #      frame, same as the returned per-bone meshes) for QC visualisation. ----
+    if debug_dir is not None:
+        from pathlib import Path as _P
+        _dd = _P(debug_dir); _dd.mkdir(parents=True, exist_ok=True)
+        _inv = final_affine.GetInverse()               # atlas-phys -> scan-phys
+        _av, _af, _, _ = measure.marching_cubes(
+            np.pad(A_solid_for_sitk, 1, constant_values=False).astype(np.float32), 0.5)
+        _av = (_av - 1) * A_pitch + A_origin_for_sitk                  # atlas-phys
+        _avs = np.array([_inv.TransformPoint([float(c) for c in p]) for p in _av],
+                        dtype=np.float32)                              # -> scan-phys
+        _ai = np.clip(np.round((_av - A_origin_for_sitk) / A_pitch).astype(int),
+                      0, np.array(A_lbl_for_sitk.shape) - 1)
+        _vl = A_lbl_for_sitk[_ai[:, 0], _ai[:, 1], _ai[:, 2]].astype(np.int16)
+        _sv, _sf, _, _ = measure.marching_cubes(
+            np.pad(N_solid, 1, constant_values=False).astype(np.float32), 0.5)
+        _sv = ((_sv - 1) * A_pitch + N_origin).astype(np.float32)
+        np.savez(_dd / f"{stl_path.stem}_atlasdbg.npz",
+                 atlas_verts=_avs, atlas_faces=_af.astype(np.int32), atlas_vlabels=_vl,
+                 scan_verts=_sv, scan_faces=_sf.astype(np.int32))
+        print(f"    [debug] {stl_path.stem}_atlasdbg.npz  atlas {len(_avs):,}v  "
+              f"scan {len(_sv):,}v | atlas-scan bbox "
+              f"{np.round(_avs.min(0),1)}..{np.round(_avs.max(0),1)}  vs scan "
+              f"{np.round(_sv.min(0),1)}..{np.round(_sv.max(0),1)}", flush=True)
 
     # Refill unlabeled by nearest labeled neighbour
     unlabeled = N_solid & (N_lbl == 0)
@@ -608,6 +654,9 @@ def _segment_via_atlas(
         bone_meshes[lid] = bm
         print(f"    bone {lid:>2}: {len(bm.vertices):>6,}v {len(bm.faces):>6,}f "
               f"vol={bm.volume:>7.0f}mm³")
+    if return_transform:
+        # final_affine maps SCAN physical coords -> ATLAS physical coords
+        return bone_meshes, final_affine
     return bone_meshes
 
 
