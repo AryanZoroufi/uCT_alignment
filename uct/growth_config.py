@@ -44,6 +44,13 @@ PAIRS = {
 }
 
 
+# Chamfer-registration variants: same VOX/GT, parts read from {occ}_chamfer
+# (produced by _segment_via_atlas(..., registration="chamfer")).
+for _base in ("B256M1", "B256M7"):
+    _c = dict(PAIRS[_base]); _c["occ"] = _c["occ"] + "_chamfer"
+    PAIRS[_base + "c"] = _c
+
+
 def get(pair_name):
     """Return the config dict for a pair (e.g. get('B256M1'))."""
     if pair_name not in PAIRS:

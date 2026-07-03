@@ -111,6 +111,23 @@ def measure(tag, gt_vox=GT_VOX_DEFAULT, save_masks=False):
             "sweep": sweep, "gt_vox": gt_vox}
 
 
+def qc_localization(cl_sweep, thresh=0.05):
+    """Automatic gap-localization QC from the CONTROL (CL) gap-band sweep.
+
+    A correctly-localized gap is near-EMPTY at the tight window and only fills as
+    the band widens into the parts (B256M1 CL: W10=122 vox = 0.03% of W60). If the
+    tight-window CL band is already a large fraction of the wide-window band, the
+    gap centre is landing INSIDE bone -> parts 1/4 mislocalized (B256M7 CL: W10 is
+    20% of W60). Returns dict(w_tight,w_wide,cl_tight,cl_wide,fill,localized).
+    """
+    ws = sorted(cl_sweep)
+    wt, ww = ws[0], ws[-1]
+    ct, cw = cl_sweep[wt]["A"], cl_sweep[ww]["A"]
+    fill = ct / max(cw, 1)
+    return dict(w_tight=wt, w_wide=ww, cl_tight=ct, cl_wide=cw,
+                fill=fill, localized=fill < thresh)
+
+
 if __name__ == "__main__":
     GT = GT_VOX_DEFAULT
 
@@ -156,3 +173,16 @@ if __name__ == "__main__":
         print(f"{W:4d} | {s:10,} | {c:10,} | {r:>7}")
     print("NOTE: lock ONE window for the whole cohort; never let CL pick its own "
           "argmin (it fills into the parts as W grows).", flush=True)
+
+    # --- automatic gap-localization QC gate (control must be near-empty at W_tight) ---
+    q = qc_localization(cl["sweep"])
+    verdict = "PASS (gap localized)" if q["localized"] else \
+        "FAIL (gap likely MISLOCALIZED -> manual QC)"
+    print(f"\n=== QC GAP-LOCALIZATION GATE ===", flush=True)
+    print(f"CL-A(W={q['w_tight']}) = {q['cl_tight']:,} vox = {100*q['fill']:.2f}% of "
+          f"CL-A(W={q['w_wide']}) = {q['cl_wide']:,}   (pass if < 5%)  ->  {verdict}",
+          flush=True)
+    if not q["localized"]:
+        print("  The contralateral gap band is NOT near-empty at the tight window: the "
+              "gap centre is inside bone (parts 1/4 mislocalized). Do NOT trust this "
+              "pair's growth number -- re-segment or hand-correct parts 1 & 4.", flush=True)
