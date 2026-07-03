@@ -21,4 +21,4 @@
 ## Usage
 
     cd uct
-    python pipeline.py <path_to_ref_vox> <path_to_sample_vox> bone_1_atlas.stl bone_2_atlas.stl -o <save_dir> --volume-scale 1.25e-4 --articular-percentile 20 --visualize
+    python pipeline.py <path_to_ref_vox> <path_to_sample_vox> b--bones 1 4 -o <save_dir> --volume-scale 1.25e-4 --visualize --neighborhood-radius 0.10 --patch-radius 0.3 --visualize

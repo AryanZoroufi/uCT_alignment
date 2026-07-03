@@ -7,10 +7,11 @@ Algorithm — 4-stage factorised SMC (full, used in aggregate mode):
   Stage 3: search per-axis scale only      (3-D, fix t+r from stages 1-2)
   Stage 4: joint 9-D fine-tuning           (tight priors around stages 1-3 MAP)
 
-Algorithm — 3-stage restricted SMC (used in per-bone refinement mode):
-  Stage 1: search x-translation only       (ty=tz=0, all rotations=0, scale=1)
-  Stage 2: search per-axis scale only      (fix tx from stage 1)
-  Stage 3: joint fine-tune tx+scale        (tight priors, rotations still locked)
+Algorithm — per-bone refinement mode (same 4-stage as aggregate, own centroid):
+  Stage 1: search translation              (3-D, rotation=0, scale=1)
+  Stage 2: search rotation                 (3-D, fix t from stage 1)
+  Stage 3: search per-axis scale           (3-D, fix t+r from stages 1-2)
+  Stage 4: joint 9-D fine-tuning           (tight priors around stages 1-3 MAP)
 
 Factorisation reduces effective dimensionality from 9 → 3 per stage, making
 importance sampling tractable with ~3000 particles per stage.
@@ -65,8 +66,8 @@ from genjax import ChoiceMapBuilder as C
 # Hyper-parameters
 # ---------------------------------------------------------------------------
 RESOLUTION      = 32      # voxel grid side (R^3 = 32768 cells)
-N_PARTICLES     = 3_000   # particles per stage
-N_SURFACE_PTS   = 5_000   # surface samples per mesh (uniform, seed=0 → deterministic)
+N_PARTICLES     = 5_000   # particles per stage
+N_SURFACE_PTS   = 8_000   # surface samples per mesh (uniform, seed=0 → deterministic)
 SIGMA_OBS       = 0.05    # IoU likelihood bandwidth: obs ~ N(iou, σ) at 1.0
 EPS             = 0.01    # half-width for "fixed" parameters in non-searched dims
 
@@ -88,34 +89,35 @@ S4_HALF = np.array([2.0, 2.0, 2.0,               # translation (mm)
                    dtype=np.float32)
 
 # ---------------------------------------------------------------------------
-# Rotation matrices (JAX)
-# ---------------------------------------------------------------------------
-
-def _Rx(a):
-    c, s = jnp.cos(a), jnp.sin(a)
-    return jnp.array([[1, 0, 0], [0, c, -s], [0, s, c]])
-
-def _Ry(a):
-    c, s = jnp.cos(a), jnp.sin(a)
-    return jnp.array([[c, 0, s], [0, 1, 0], [-s, 0, c]])
-
-def _Rz(a):
-    c, s = jnp.cos(a), jnp.sin(a)
-    return jnp.array([[c, -s, 0], [s, c, 0], [0, 0, 1]])
-
-def rotation_matrix(rx, ry, rz):
-    """ZYX convention: Rz @ Ry @ Rx (Rx applied first)."""
-    return _Rz(rz) @ _Ry(ry) @ _Rx(rx)
-
-# ---------------------------------------------------------------------------
 # Point transformation (JAX)
+# ---------------------------------------------------------------------------
+# NOTE: jnp.array([[1,0,0],[0,c,-s],...]) with traced scalar values (c, s)
+# causes XlaRuntimeError in JAX ≥0.5.x under vmap.  Use elementwise ops
+# instead of matrix construction + @ to keep everything in the traced graph.
 # ---------------------------------------------------------------------------
 
 def transform_pts(pts, centroid, t, rx, ry, rz, sx, sy, sz):
-    """Centre → scale → rotate → translate back → offset."""
-    c = (pts - centroid) * jnp.array([sx, sy, sz])
-    c = (rotation_matrix(rx, ry, rz) @ c.T).T
-    return c + centroid + t
+    """Centre → scale → rotate (ZYX Euler: Rx then Ry then Rz) → translate."""
+    # center and scale
+    cx = (pts[:, 0] - centroid[0]) * sx
+    cy = (pts[:, 1] - centroid[1]) * sy
+    cz = (pts[:, 2] - centroid[2]) * sz
+
+    # Rx
+    crx, srx = jnp.cos(rx), jnp.sin(rx)
+    cx, cy, cz = cx, crx * cy - srx * cz, srx * cy + crx * cz
+
+    # Ry
+    cry, sry = jnp.cos(ry), jnp.sin(ry)
+    cx, cy, cz = cry * cx + sry * cz, cy, -sry * cx + cry * cz
+
+    # Rz
+    crz, srz = jnp.cos(rz), jnp.sin(rz)
+    cx, cy, cz = crz * cx - srz * cy, srz * cx + crz * cy, cz
+
+    return jnp.stack([cx + centroid[0] + t[0],
+                      cy + centroid[1] + t[1],
+                      cz + centroid[2] + t[2]], axis=1)
 
 # ---------------------------------------------------------------------------
 # Voxelisation & IoU (JAX, RESOLUTION is a compile-time constant)
@@ -152,7 +154,7 @@ def alignment_model(sample_pts, centroid, ref_grid, vmin, vmax, lo, hi):
     sy = genjax.uniform(lo[7], hi[7]) @ "sy"
     sz = genjax.uniform(lo[8], hi[8]) @ "sz"
 
-    t_vec       = jnp.array([tx, ty, tz])
+    t_vec       = jnp.stack([tx, ty, tz])
     transformed = transform_pts(sample_pts, centroid, t_vec, rx, ry, rz, sx, sy, sz)
     sample_grid = voxelize(transformed, vmin, vmax)
     iou         = iou_grids(sample_grid, ref_grid)
@@ -227,7 +229,7 @@ def _apply_params(verts_np: np.ndarray, centroid_np: np.ndarray,
 # ---------------------------------------------------------------------------
 
 def _run_4stage(key, sample_pts_j, centroid_j, ref_grid_j, vmin, vmax,
-                run_label: str = "") -> tuple[dict, float]:
+                run_label: str = "", stage_cb=None) -> tuple[dict, float]:
     """Run the 4-stage factorised IS; return (best_params, best_iou)."""
     tag = f" [{run_label}]" if run_label else ""
 
@@ -243,6 +245,7 @@ def _run_4stage(key, sample_pts_j, centroid_j, ref_grid_j, vmin, vmax,
     m1 = _map_params(p1);  del p1
     iou1 = _iou_for(m1, sample_pts_j, centroid_j, ref_grid_j, vmin, vmax)
     _print_params("stage 1", m1, iou1)
+    if stage_cb: stage_cb(1, m1, iou1)
 
     print(f"Stage 2/4{tag} — rotation ({N_PARTICLES} particles) ...")
     lo2 = np.array([m1["tx"]-EPS, m1["ty"]-EPS, m1["tz"]-EPS,
@@ -256,6 +259,7 @@ def _run_4stage(key, sample_pts_j, centroid_j, ref_grid_j, vmin, vmax,
     m2 = _map_params(p2);  del p2
     iou2 = _iou_for(m2, sample_pts_j, centroid_j, ref_grid_j, vmin, vmax)
     _print_params("stage 2", m2, iou2)
+    if stage_cb: stage_cb(2, m2, iou2)
 
     print(f"Stage 3/4{tag} — scale ({N_PARTICLES} particles) ...")
     lo3 = np.array([m2["tx"]-EPS, m2["ty"]-EPS, m2["tz"]-EPS,
@@ -269,6 +273,7 @@ def _run_4stage(key, sample_pts_j, centroid_j, ref_grid_j, vmin, vmax,
     m3 = _map_params(p3);  del p3
     iou3 = _iou_for(m3, sample_pts_j, centroid_j, ref_grid_j, vmin, vmax)
     _print_params("stage 3", m3, iou3)
+    if stage_cb: stage_cb(3, m3, iou3)
 
     print(f"Stage 4/4{tag} — joint fine-tune ({N_PARTICLES} particles) ...")
     center4 = np.array([m3["tx"], m3["ty"], m3["tz"],
@@ -281,6 +286,7 @@ def _run_4stage(key, sample_pts_j, centroid_j, ref_grid_j, vmin, vmax,
     m4 = _map_params(p4);  del p4
     iou4 = _iou_for(m4, sample_pts_j, centroid_j, ref_grid_j, vmin, vmax)
     _print_params("stage 4", m4, iou4)
+    if stage_cb: stage_cb(4, m4, iou4)
 
     best_iou, best_params = iou1, m1
     for iou_s, m_s in [(iou2, m2), (iou3, m3), (iou4, m4)]:
@@ -294,7 +300,7 @@ def _run_4stage(key, sample_pts_j, centroid_j, ref_grid_j, vmin, vmax,
 # ---------------------------------------------------------------------------
 
 def _run_3stage_tx_scale(key, sample_pts_j, centroid_j, ref_grid_j, vmin, vmax,
-                         run_label: str = "") -> tuple[dict, float]:
+                         run_label: str = "", stage_cb=None) -> tuple[dict, float]:
     """
     Search only tx (x-translation) and sx/sy/sz (per-axis scale).
     ty, tz, rx, ry, rz are all locked to 0 / 1.
@@ -311,6 +317,7 @@ def _run_3stage_tx_scale(key, sample_pts_j, centroid_j, ref_grid_j, vmin, vmax,
     m1 = _map_params(p1); del p1
     iou1 = _iou_for(m1, sample_pts_j, centroid_j, ref_grid_j, vmin, vmax)
     _print_params("stage 1", m1, iou1)
+    if stage_cb: stage_cb(1, m1, iou1)
 
     print(f"Stage 2/3{tag} — scale ({N_PARTICLES} particles) ...")
     lo2 = np.array([m1["tx"]-EPS, -EPS, -EPS,  -EPS, -EPS, -EPS,
@@ -322,6 +329,7 @@ def _run_3stage_tx_scale(key, sample_pts_j, centroid_j, ref_grid_j, vmin, vmax,
     m2 = _map_params(p2); del p2
     iou2 = _iou_for(m2, sample_pts_j, centroid_j, ref_grid_j, vmin, vmax)
     _print_params("stage 2", m2, iou2)
+    if stage_cb: stage_cb(2, m2, iou2)
 
     print(f"Stage 3/3{tag} — joint fine-tune tx+scale ({N_PARTICLES} particles) ...")
     S3_HALF = np.array([2.0, EPS, EPS,  EPS, EPS, EPS,  0.06, 0.06, 0.06],
@@ -335,6 +343,7 @@ def _run_3stage_tx_scale(key, sample_pts_j, centroid_j, ref_grid_j, vmin, vmax,
     m3 = _map_params(p3); del p3
     iou3 = _iou_for(m3, sample_pts_j, centroid_j, ref_grid_j, vmin, vmax)
     _print_params("stage 3", m3, iou3)
+    if stage_cb: stage_cb(3, m3, iou3)
 
     best_iou, best_params = iou1, m1
     for iou_s, m_s in [(iou2, m2), (iou3, m3)]:
@@ -351,20 +360,31 @@ def _run_is(ref_mesh: trimesh.Trimesh,
             sample_mesh: trimesh.Trimesh,
             seed: int = 0,
             n_restarts: int = 3,
-            stage_fn=None) -> tuple[dict, float, float]:
+            stage_fn=None,
+            probe_cb=None) -> tuple[dict, float, float]:
     """
     Run multi-restart IS on a (ref, sample) mesh pair.
+
+    Mirror strategy — probe then exploit:
+      Phase 1: run one full IS restart per mirror orientation (up to 4 probes).
+               This rotation-searches ALL orientations, not just the one with the
+               best baseline IoU.  A mirror with lower baseline IoU can easily
+               converge to a higher final IoU after rotation search (e.g. when the
+               bones need a large rotation that the baseline cannot predict).
+      Phase 2: run the remaining restarts (n_restarts − n_probes) from the mirror
+               that produced the highest IoU in Phase 1.
 
     Returns
     -------
     best_params   : dict with tx/ty/tz/rx/ry/rz/sx/sy/sz
     best_iou      : IoU achieved by best_params
-    baseline_iou  : IoU with no transform applied
+    baseline_iou  : IoU of the identity transform (no mirror, no rotation)
     best_mirror   : None, or 0/1/2 (axis that was mirrored before IS)
     """
     if stage_fn is None:
         stage_fn = _run_4stage
 
+    # ── Reference grid (fixed throughout)
     rv_sub, _ = trimesh.sample.sample_surface(ref_mesh, N_SURFACE_PTS, seed=0)
     rv_sub = rv_sub.astype(np.float32)
     ref_pts_j = jnp.array(rv_sub, dtype=jnp.float32)
@@ -375,69 +395,80 @@ def _run_is(ref_mesh: trimesh.Trimesh,
     vmax = jnp.array(rpts.max(0) + pad)
     ref_grid_j = voxelize(ref_pts_j, vmin, vmax)
 
-    # ── Mirror screening: try identity + 3 axis flips, pick best baseline IoU
-    sample_verts_np  = np.array(sample_mesh.vertices, dtype=np.float32)
+    sample_verts_np    = np.array(sample_mesh.vertices, dtype=np.float32)
     sample_centroid_np = sample_verts_np.mean(0)
 
-    print(f"  Screening mirror configurations ...")
-    best_mirror_iou  = -1.0
-    best_mirror_axis = None           # None = no flip
-    mirror_label     = "none"
+    MIRRORS = [(None, "none"), (0, "flip-x"), (1, "flip-y"), (2, "flip-z")]
 
-    for axis, label in [(None, "none"), (0, "flip-x"), (1, "flip-y"), (2, "flip-z")]:
+    # ── Pre-compute per-mirror sample data + baseline IoUs (cheap)
+    print("  Mirror baselines (unoptimised):")
+    mirror_data: dict = {}   # axis → (sample_pts_j, centroid_j, baseline_iou)
+    none_baseline = 0.0
+    for axis, label in MIRRORS:
         v = (_mirror_verts(sample_verts_np, sample_centroid_np, axis)
              if axis is not None else sample_verts_np)
         sv, _ = trimesh.sample.sample_surface(
             trimesh.Trimesh(vertices=v, faces=sample_mesh.faces), N_SURFACE_PTS, seed=0)
-        iou_m = float(iou_grids(voxelize(jnp.array(sv.astype(np.float32)), vmin, vmax),
-                                ref_grid_j))
-        print(f"    {label:8s}  baseline IoU = {iou_m:.4f}")
-        if iou_m > best_mirror_iou:
-            best_mirror_iou  = iou_m
-            best_mirror_axis = axis
-            mirror_label     = label
+        sv    = sv.astype(np.float32)
+        s_pts = jnp.array(sv, dtype=jnp.float32)
+        c_j   = jnp.array(v, dtype=jnp.float32).mean(axis=0)
+        bl    = float(iou_grids(voxelize(s_pts, vmin, vmax), ref_grid_j))
+        print(f"    {label:8s}  baseline IoU = {bl:.4f}")
+        mirror_data[axis] = (s_pts, c_j, bl)
+        if axis is None:
+            none_baseline = bl
 
-    print(f"  Best mirror: {mirror_label}  (IoU={best_mirror_iou:.4f})")
+    # ── Phase 1: one IS restart per mirror (probe all orientations)
+    n_probes = min(len(MIRRORS), n_restarts)
+    probe_results = []   # (axis, label, params, iou)
 
-    # Apply chosen mirror to sample for all subsequent IS runs
-    if best_mirror_axis is not None:
-        sv_np = _mirror_verts(sample_verts_np, sample_centroid_np, best_mirror_axis)
-        s_mesh_used = trimesh.Trimesh(vertices=sv_np, faces=sample_mesh.faces)
-        s_mesh_used.merge_vertices()
-    else:
-        s_mesh_used = sample_mesh
-
-    sv_sub, _ = trimesh.sample.sample_surface(s_mesh_used, N_SURFACE_PTS, seed=0)
-    sv_sub = sv_sub.astype(np.float32)
-    sample_pts_j = jnp.array(sv_sub, dtype=jnp.float32)
-    centroid_j   = jnp.array(s_mesh_used.vertices, dtype=jnp.float32).mean(axis=0)
-
-    baseline_iou = best_mirror_iou
-    print(f"  Baseline IoU (no transform): {baseline_iou:.4f}")
-
-    best_iou    = baseline_iou
-    best_params: dict = {"tx": 0., "ty": 0., "tz": 0.,
-                         "rx": 0., "ry": 0., "rz": 0.,
-                         "sx": 1., "sy": 1., "sz": 1.}
-    best_restart = "baseline"
-
-    for r in range(n_restarts):
+    print(f"\n  Phase 1 — probing {n_probes} mirror(s) (one restart each) ...")
+    for pi in range(n_probes):
+        axis, label = MIRRORS[pi]
+        s_pts, c_j, bl = mirror_data[axis]
         print(f"\n{'='*50}")
-        print(f"Restart {r+1}/{n_restarts}  (seed={seed + r})")
+        print(f"Probe {pi+1}/{n_probes}  mirror={label}  baseline={bl:.4f}  (seed={seed+pi})")
         print(f"{'='*50}")
-        key = jax.random.key(seed + r)
-        params_r, iou_r = stage_fn(key, sample_pts_j, centroid_j,
-                                   ref_grid_j, vmin, vmax,
-                                   run_label=f"restart {r+1}")
-        print(f"\n  Restart {r+1} best IoU: {iou_r:.4f}")
+        key      = jax.random.key(seed + pi)
+        _scb = (lambda si, p, iou, _ax=axis, _pi=pi: probe_cb(_pi, _ax, si, p, iou)) if probe_cb else None
+        params_r, iou_r = stage_fn(key, s_pts, c_j, ref_grid_j, vmin, vmax,
+                                   run_label=f"probe {pi+1} [{label}]",
+                                   stage_cb=_scb)
+        print(f"\n  Probe {pi+1} [{label}]: IoU = {iou_r:.4f}")
+        probe_results.append((axis, label, params_r, iou_r))
+
+    # Best mirror = highest post-IS IoU from Phase 1
+    best_pi       = int(np.argmax([r[3] for r in probe_results]))
+    best_axis, best_label, best_params, best_iou = probe_results[best_pi]
+    best_s_pts, best_c_j, _ = mirror_data[best_axis]
+
+    print(f"\n  Best mirror from probes: {best_label}  (IoU={best_iou:.4f})")
+
+    # ── Phase 2: extra restarts from the winning mirror
+    n_extra = n_restarts - n_probes
+    if n_extra > 0:
+        print(f"  Phase 2 — {n_extra} more restart(s) from mirror={best_label} ...")
+
+    for r in range(n_extra):
+        print(f"\n{'='*50}")
+        print(f"Restart {n_probes+r+1}/{n_restarts}  mirror={best_label}  "
+              f"(seed={seed+n_probes+r})")
+        print(f"{'='*50}")
+        key      = jax.random.key(seed + n_probes + r)
+        _ri = n_probes + r
+        _scb = (lambda si, p, iou, _ax=best_axis, _ri=_ri: probe_cb(_ri, _ax, si, p, iou)) if probe_cb else None
+        params_r, iou_r = stage_fn(key, best_s_pts, best_c_j, ref_grid_j, vmin, vmax,
+                                   run_label=f"restart {n_probes+r+1} [{best_label}]",
+                                   stage_cb=_scb)
+        print(f"\n  Restart {n_probes+r+1}: IoU = {iou_r:.4f}")
         if iou_r > best_iou:
-            best_iou, best_params, best_restart = iou_r, params_r, f"restart {r+1}"
+            best_iou, best_params = iou_r, params_r
 
     print(f"\n{'='*50}")
-    print(f"  Winning: {best_restart}  mirror={mirror_label}  IoU={best_iou:.4f}  "
-          f"(Δ vs baseline: {best_iou - baseline_iou:+.4f})")
+    print(f"  Winning: mirror={best_label}  IoU={best_iou:.4f}  "
+          f"(Δ vs identity: {best_iou - none_baseline:+.4f})")
 
-    return best_params, best_iou, baseline_iou, best_mirror_axis
+    return best_params, best_iou, none_baseline, best_axis
 
 
 # ---------------------------------------------------------------------------
@@ -482,6 +513,7 @@ def smc_align_aggregate(
     output_dir:   str | Path,
     seed:         int = 0,
     n_restarts:   int = 3,
+    frame_cb=None,
 ) -> tuple[float, dict]:
     """
     Align N sample bones to N reference bones while preserving relative structure.
@@ -533,12 +565,25 @@ def smc_align_aggregate(
     print(f"  Surface pts (each aggregate): {N_SURFACE_PTS:,}")
 
     # IS on the aggregates
-    best_params, best_iou, _, mirror_axis = _run_is(ref_agg, sample_agg,
-                                                     seed=seed, n_restarts=n_restarts)
-
-    # Aggregate centroid — the SAME pivot is used for every individual bone so
-    # that their relative positions are preserved after transformation.
+    agg_verts_orig = [np.array(m.vertices, dtype=np.float32) for m in sample_meshes]
     agg_centroid_np = np.array(sample_agg.vertices, dtype=np.float32).mean(0)
+
+    def _agg_probe_cb(probe_i, mirror_axis, stage_i, params, iou=None):
+        if frame_cb is None:
+            return
+        transformed = []
+        for v_orig in agg_verts_orig:
+            v = v_orig.copy()
+            if mirror_axis is not None:
+                v = _mirror_verts(v, agg_centroid_np, mirror_axis)
+            v = _apply_params(v, agg_centroid_np, params)
+            transformed.append(v)
+        label = f"agg  probe {probe_i+1}  stage {stage_i}/4"
+        frame_cb(label, transformed, iou)
+
+    best_params, best_iou, _, mirror_axis = _run_is(ref_agg, sample_agg,
+                                                     seed=seed, n_restarts=n_restarts,
+                                                     probe_cb=_agg_probe_cb)
 
     # Apply the aggregate transform to each sample bone individually
     print(f"\n  Saving {n} transformed sample bones → {output_dir}/")
@@ -557,7 +602,7 @@ def smc_align_aggregate(
 
 
 # ---------------------------------------------------------------------------
-# Public API — per-bone refinement (tx + scale only, no rotation / ty / tz)
+# Public API — per-bone refinement (full 9-DOF per bone)
 # ---------------------------------------------------------------------------
 
 def smc_align_per_bone(
@@ -566,19 +611,26 @@ def smc_align_per_bone(
     output_dir:   str | Path,
     seed:         int = 0,
     n_restarts:   int = 3,
+    frame_cb=None,
 ) -> None:
     """
-    Refine each matched bone pair independently, searching only x-translation
-    and per-axis scale.  y/z translation and all rotations are locked to 0
-    so the global aggregate alignment is preserved.
+    Refine each matched bone pair independently with full 9-DOF search
+    (translation + rotation + scale), pivoting on each bone's own centroid.
 
-    Each bone uses its own centroid as the scale pivot.
+    After the aggregate alignment in step 7, each bone may still carry a
+    residual rotation error — the smaller bone in particular contributes less
+    to the aggregate IoU and can be left misaligned.  The previous tx+scale
+    restriction caused the optimiser to compensate with extreme non-uniform
+    scale factors (15–20%) instead of correcting the underlying rotation, which
+    degraded both IoU and the shape comparison.
+
+    Allowing full rotation per bone corrects this without touching the other
+    bone's position.
 
     Parameters
     ----------
     ref_paths, sample_paths : ordered lists of STL paths (already aggregate-aligned)
-    output_dir              : where to save refined sample bones (overwrites in-place
-                              if output_dir == directory of sample_paths)
+    output_dir              : where to save refined sample bones
     seed, n_restarts        : IS random seed and number of independent restarts
     """
     output_dir = Path(output_dir)
@@ -587,10 +639,20 @@ def smc_align_per_bone(
     n = len(ref_paths)
     assert n == len(sample_paths)
 
+    # Track current vertex state for all bones (updated as each bone finalizes).
+    # Used so per-bone frames show all bones at their current best position.
+    current_verts = []
+    current_faces = []
+    for p in sample_paths:
+        m = trimesh.load(str(p), force="mesh", process=False)
+        m.merge_vertices()
+        current_verts.append(np.array(m.vertices, dtype=np.float32))
+        current_faces.append(np.array(m.faces))
+
     for i, (ref_path, sample_path) in enumerate(zip(ref_paths, sample_paths)):
         print(f"\n{'='*60}")
         print(f"Per-bone refinement  {i+1}/{n}: {Path(sample_path).name}")
-        print(f"  (tx + scale only — rotation and ty/tz locked)")
+        print(f"  (full 9-DOF: translation + rotation + scale)")
         print(f"{'='*60}")
 
         ref    = trimesh.load(str(ref_path),    force="mesh", process=False)
@@ -599,10 +661,27 @@ def smc_align_per_bone(
         print(f"  Ref:    {len(ref.vertices):,} verts  |  "
               f"Sample: {len(sample.vertices):,} verts")
 
+        _bone_verts_pre = np.array(sample.vertices, dtype=np.float32)
+        _bone_centroid  = _bone_verts_pre.mean(0)
+
+        def _bone_probe_cb(probe_i, mirror_axis, stage_i, params, iou=None,
+                           _i=i, _bv=_bone_verts_pre, _bc=_bone_centroid):
+            if frame_cb is None:
+                return
+            v = _bv.copy()
+            if mirror_axis is not None:
+                v = _mirror_verts(v, _bc, mirror_axis)
+            v = _apply_params(v, _bc, params)
+            all_verts = list(current_verts)
+            all_verts[_i] = v
+            label = f"bone {_i+1}/{n}  probe {probe_i+1}  stage {stage_i}/3"
+            frame_cb(label, all_verts, iou)
+
         best_params, best_iou, baseline_iou, mirror_axis = _run_is(
             ref, sample,
             seed=seed, n_restarts=n_restarts,
-            stage_fn=_run_3stage_tx_scale,
+            stage_fn=_run_4stage,
+            probe_cb=_bone_probe_cb,
         )
 
         print(f"\n  Final IoU: {best_iou:.4f}  "

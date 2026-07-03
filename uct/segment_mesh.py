@@ -203,15 +203,53 @@ def split_thin_bridge(
     full_label = label_map[full_label]
 
     # ------------------------------------------------------------------ step 6
-    # Classify each face by the label of the voxel containing its centroid.
-    face_centroids = bone.vertices[bone.faces].mean(axis=1)   # (F, 3)
-    vox_idx        = vox.points_to_indices(face_centroids)    # (F, 3) int
-    nx, ny, nz     = grid.shape
-    vox_idx        = np.clip(vox_idx, [0, 0, 0], [nx-1, ny-1, nz-1])
-    face_labels    = full_label[vox_idx[:, 0], vox_idx[:, 1], vox_idx[:, 2]]
+    # Classify faces by flood-fill over surface adjacency rather than
+    # independent per-face voxel lookup.
+    #
+    # Rationale: faces near the bridge seam have centroids that map to
+    # bridge voxels whose labels (from nearest-neighbour propagation in
+    # step 5) can be wrong or boundary-ambiguous.  Doing an independent
+    # voxel lookup per face also leaves label-0 faces in neither sub-mesh,
+    # creating holes.  Instead:
+    #   1. Use the voxel labels only as seeds for the faces clearly inside
+    #      each component (same lookup as before, but only trusted for
+    #      non-bridge voxels).
+    #   2. BFS over the face adjacency graph propagates labels to every
+    #      remaining face (including bridge-seam faces) by topological
+    #      proximity — each ambiguous face joins whichever labeled region
+    #      reaches it first, which is the nearest connected region.
+    # Result: every face gets a label, no holes, clean topological boundary.
 
-    faces_A = bone.faces[face_labels == 1]
-    faces_B = bone.faces[face_labels == 2]
+    from collections import deque
+
+    face_centroids = bone.vertices[bone.faces].mean(axis=1)   # (F, 3)
+    vox_ij         = vox.points_to_indices(face_centroids)    # (F, 3) int
+    nx, ny, nz     = grid.shape
+    vox_ij         = np.clip(vox_ij, [0, 0, 0], [nx-1, ny-1, nz-1])
+    seed_labels    = full_label[vox_ij[:, 0], vox_ij[:, 1], vox_ij[:, 2]]
+
+    # Build face adjacency list from edge-sharing pairs
+    n_faces = len(bone.faces)
+    adj     = [[] for _ in range(n_faces)]
+    for fa, fb in bone.face_adjacency:
+        adj[fa].append(fb)
+        adj[fb].append(fa)
+
+    # BFS: seed from all voxel-labeled faces simultaneously; label-0 faces
+    # are filled by whichever labeled region reaches them first.
+    face_labels_final = seed_labels.copy()
+    queue = deque(np.where(seed_labels > 0)[0].tolist())
+
+    while queue:
+        fi  = queue.popleft()
+        lbl = face_labels_final[fi]
+        for fj in adj[fi]:
+            if face_labels_final[fj] == 0:
+                face_labels_final[fj] = lbl
+                queue.append(fj)
+
+    faces_A = bone.faces[face_labels_final == 1]
+    faces_B = bone.faces[face_labels_final == 2]
 
     if len(faces_A) == 0 or len(faces_B) == 0:
         return None

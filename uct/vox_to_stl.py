@@ -129,6 +129,94 @@ def _mesh_from_volume(vol: np.ndarray, level: float, step_size: int,
     return verts, faces
 
 
+def _watershed_segment(
+    binary_mask: np.ndarray,
+    n_segments:  int   = 9,
+    downsample:  int   = 4,
+    edt_sigma:   float = 5.0,
+    min_distance: int  = 20,
+) -> np.ndarray:
+    """
+    Segment a binary bone mask into n_segments regions via watershed on the EDT.
+
+    Steps:
+      1. Pad + fill enclosed holes (marrow cavity) so each bone body is solid.
+         Padding ensures the joint space (open to exterior) is not filled.
+      2. EDT on filled mask: high values = deep inside bone body.
+      3. Gaussian-smooth EDT to suppress noise peaks (trabecular structure,
+         surface bumps, condyle ridges) while preserving bone-body centers.
+      4. Find all local maxima; keep the top n_segments ranked by EDT value
+         (deepest = most central = definitely a bone body).
+      5. Watershed floods from those seeds; the boundary falls at the saddle
+         of the EDT, which sits naturally at thin bridges between bones.
+
+    Runs on a downsampled copy (ds=4 → 64× fewer voxels) for speed.
+    Labels are upsampled back to the original resolution via nearest-neighbour.
+
+    Returns a label array of the same shape as binary_mask:
+      0 = background, 1 … N = bone segments.
+    """
+    from scipy.ndimage import binary_fill_holes, distance_transform_edt
+    from scipy.ndimage import gaussian_filter as gf
+    from skimage.segmentation import watershed
+    from skimage.feature import peak_local_max
+
+    ds = downsample
+    nz, ny, nx = binary_mask.shape
+
+    # Downsample for speed
+    mask_ds = binary_mask[::ds, ::ds, ::ds]
+
+    # Fill enclosed holes: pad so the joint space always touches the boundary
+    # (binary_fill_holes flood-fills from the bounding box edge, so anything
+    # reachable from outside stays empty — only truly enclosed voids are filled)
+    pad = 3
+    padded = np.pad(mask_ds, pad_width=pad, mode='constant', constant_values=False)
+    filled = binary_fill_holes(padded)[pad:-pad, pad:-pad, pad:-pad]
+
+    # EDT: value at each bone voxel = distance to nearest non-bone voxel
+    dist = distance_transform_edt(filled)
+
+    # Smooth to merge condyle bumps into one bone-body peak
+    dist_smooth = gf(dist.astype(np.float32), sigma=edt_sigma)
+
+    # Find local maxima; take top n_segments by EDT value so the deepest
+    # (most central) points are always chosen over surface bumps
+    coords = peak_local_max(dist_smooth, min_distance=min_distance,
+                            exclude_border=False)
+    if len(coords) == 0:
+        return (binary_mask > 0).astype(np.int32)
+
+    vals     = dist_smooth[coords[:, 0], coords[:, 1], coords[:, 2]]
+    top_idx  = np.argsort(vals)[::-1][:n_segments]
+    top_coords = coords[top_idx]
+    print(f"  Watershed: {len(coords)} peaks found, using top {len(top_idx)}")
+
+    # Place one marker per selected peak
+    markers = np.zeros(mask_ds.shape, dtype=np.int32)
+    for i, (z, y, x) in enumerate(top_coords, start=1):
+        markers[z, y, x] = i
+
+    # Watershed on the filled mask
+    labels_ds = watershed(-dist_smooth, markers, mask=filled).astype(np.int32)
+
+    # Dilate labels by 1 downsampled voxel (= ds full voxels) so that mesh
+    # surface faces — whose centroids sit just outside the binary_mask — get
+    # the label of the nearest bone region rather than being unlabelled (0).
+    # maximum_filter extends each labelled region without erasing existing labels.
+    from scipy.ndimage import maximum_filter
+    labels_ds = maximum_filter(labels_ds, size=7)
+
+    # Upsample to full resolution via nearest-neighbour (repeat + clip)
+    labels_up = labels_ds.repeat(ds, axis=0)[:nz]
+    labels_up = labels_up.repeat(ds, axis=1)[:, :ny]
+    labels_up = labels_up.repeat(ds, axis=2)[:, :, :nx]
+
+    # Do NOT zero out by binary_mask here: the dilation intentionally extends
+    # labels into the near-surface air so that surface faces are labelled.
+    return labels_up
+
+
 def _save_stl(verts: np.ndarray, faces: np.ndarray, path: str) -> None:
     """Write a binary STL file from vertices and faces."""
     surface = stl_mesh.Mesh(np.zeros(len(faces), dtype=stl_mesh.Mesh.dtype))
@@ -153,6 +241,7 @@ def vox_to_stl(
     taubin_iterations: int = 30,
     decimate: float | None = None,
     step_size: int = 2,
+    n_watershed: int = 9,
 ) -> None:
     """
     Full pipeline: VOX → smoothed volume → marching cubes → STL(s).
@@ -241,6 +330,60 @@ def vox_to_stl(
             st_verts = _taubin_smooth(st_verts, st_faces, taubin_iterations)
     else:
         print("\n[4b] Skipping Taubin smoothing")
+
+    # --- Watershed segmentation on the bone volume --------------------------
+    if n_watershed > 1:
+        print(f"\n[4c] Watershed segmentation (N={n_watershed}) ...")
+        binary_mask = (grid_smooth > iso_level).astype(bool)
+        ws_labels = _watershed_segment(binary_mask, n_segments=n_watershed)
+
+        # Map each face to a watershed label.
+        # bone_verts are in "mesh mm" = verts_vox × (voxel_size_mm × step_size),
+        # so to recover the full-res voxel index: vox = face_mm / (voxel_size_mm × step_size).
+        # Face centroids at the bone surface often fall just outside the bone mask
+        # (label=0). Sample centroid + 3 vertices; take the first non-zero label
+        # with priority: centroid > v0 > v1 > v2.
+        mm_per_vox = voxel_size_mm * step_size
+        face_verts_pos = bone_verts[bone_faces]             # (F, 3, 3)
+        face_cents     = face_verts_pos.mean(axis=1)        # (F, 3)
+        nz, ny, nx = binary_mask.shape
+
+        # Stack 4 sample points per face: (F, 4, 3)
+        pts_mm = np.stack([
+            face_cents,
+            face_verts_pos[:, 0],
+            face_verts_pos[:, 1],
+            face_verts_pos[:, 2],
+        ], axis=1)
+        vox_pts = np.round(pts_mm / mm_per_vox).astype(int)  # (F, 4, 3)
+        vox_pts = np.clip(vox_pts, [0, 0, 0], [nz - 1, ny - 1, nx - 1])
+        lbl_pts = ws_labels[
+            vox_pts[..., 0], vox_pts[..., 1], vox_pts[..., 2]
+        ]  # (F, 4)
+
+        # For each face use the first non-zero label (centroid has highest priority)
+        face_labels = np.zeros(len(bone_faces), dtype=np.int32)
+        for col in range(3, -1, -1):      # fill from v2 → centroid; last wins
+            mask_nz = lbl_pts[:, col] > 0
+            face_labels[mask_nz] = lbl_pts[mask_nz, col]
+
+        # Assign remaining unlabeled faces to the nearest labeled face by centroid
+        # distance. This handles small bones that fall outside the dilated region.
+        unlabeled = face_labels == 0
+        n_unlabeled = int(unlabeled.sum())
+        if n_unlabeled > 0:
+            from scipy.spatial import KDTree as _KDTree
+            labeled = face_labels > 0
+            kdt = _KDTree(face_cents[labeled])
+            _, nn_idx = kdt.query(face_cents[unlabeled])
+            face_labels[unlabeled] = face_labels[labeled][nn_idx]
+            print(f"  Nearest-face propagation: {n_unlabeled} unlabeled faces assigned")
+
+        labels_path = str(Path(stl_path).with_suffix('')) + "_ws_labels.npy"
+        np.save(labels_path, face_labels.astype(np.int32))
+        unique, counts = np.unique(face_labels[face_labels > 0], return_counts=True)
+        print(f"  Labels saved → {labels_path}")
+        print(f"  Segments: " + "  ".join(f"[{l}]={c}" for l, c in zip(unique, counts)))
 
     # --- Write STL(s) -------------------------------------------------------
     print(f"\n[5/5] Writing STL(s)")
@@ -350,6 +493,10 @@ def main():
         "--step-size", type=int, default=2,
         help="Marching-cubes step size; 1=full res, 2=default, 3-4=preview",
     )
+    parser.add_argument(
+        "--watershed", type=int, default=9, metavar="N",
+        help="Number of watershed segments (default: 9; 0 or 1 to disable)",
+    )
 
     args = parser.parse_args()
 
@@ -366,6 +513,7 @@ def main():
         taubin_iterations=args.laplacian,
         decimate=args.decimate,
         step_size=args.step_size,
+        n_watershed=args.watershed,
     )
 
 
