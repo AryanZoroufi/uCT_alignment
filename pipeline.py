@@ -125,7 +125,9 @@ def circumradii(pts, Sx):
     rhs = np.stack([(b * b - a * a).sum(1), (c * c - a * a).sum(1), (e * e - a * a).sum(1)], axis=1)
     good = np.abs(np.linalg.det(A)) > 1e-9; R = np.full(len(Sx), np.inf)
     if good.any():
-        R[good] = np.linalg.norm(np.linalg.solve(A[good], rhs[good]) - a[good], axis=1)
+        # solve per-tet 3x3 systems; rhs[..., None] keeps it a stack of vectors under NumPy>=2.0
+        sol = np.linalg.solve(A[good], rhs[good][:, :, None])[:, :, 0]
+        R[good] = np.linalg.norm(sol - a[good], axis=1)
     return R
 
 
