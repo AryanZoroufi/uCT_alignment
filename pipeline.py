@@ -35,6 +35,8 @@ import webbrowser
 import functools
 import http.server
 import socketserver
+import concurrent.futures as cf
+import multiprocessing as mp
 from pathlib import Path
 from collections import Counter
 import numpy as np
@@ -249,6 +251,11 @@ def build_and_serve(slp, cla, kept, peak, a, u, w, vsize, RR, HH, out_dir, port)
 
 
 # ---- main --------------------------------------------------------------------
+def _seg_leg(args):
+    """Worker for parallel SL/CL segmentation. Returns tibia()'s tuple."""
+    return tibia(args[0], args[1])
+
+
 def main():
     ap = argparse.ArgumentParser(description="Measure ectopic tibial bone growth (SL vs CL).")
     ap.add_argument("--sl-path", "--sl_path", dest="sl_path", required=True, help="surgical (transplant) .VOX path")
@@ -269,15 +276,15 @@ def main():
     RR = args.disc_radius * STEP        # radius mm -> mesh
     HH = args.disc_height               # full height mm == half-height in mesh units (STEP=2)
 
-    print(f"[1/4] loading & meshing SL {args.sl_path}", flush=True)
-    slp, vsize, slmesh, p1m, p4m = tibia(args.sl_path, args.hu_th)
-    print(f"[2/4] loading & meshing CL {args.cl_path}", flush=True)
-    clp, _, clmesh, _, _ = tibia(args.cl_path, args.hu_th)
-    print("[3/4] aligning CL -> SL", flush=True)
+    print("[1/3] loading & meshing & segmenting SL + CL (parallel)", flush=True)
+    with cf.ProcessPoolExecutor(max_workers=2, mp_context=mp.get_context("spawn")) as ex:
+        (slp, vsize, slmesh, p1m, p4m), (clp, _cv, clmesh, _c1, _c4) = list(
+            ex.map(_seg_leg, [(args.sl_path, args.hu_th), (args.cl_path, args.hu_th)]))
+    print("[2/3] aligning CL -> SL", flush=True)
     cla = cl_to_sl(clmesh, slmesh)(clp)
     a, u, w = pca_axis(slp)
     peak = growth_centre(slp, cla, a, u, w, vsize, p1m, p4m)
-    print("[4/4] measuring growth", flush=True)
+    print("[3/3] measuring growth", flush=True)
     nvox, kept = growth_volume(slp, cla, peak, a, u, w, vsize, RR, HH)
     vmm = vsize / 2.0; mm3 = nvox * vmm ** 3
 
