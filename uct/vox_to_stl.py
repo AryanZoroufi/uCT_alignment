@@ -74,10 +74,11 @@ def load_vox(path: str) -> tuple[np.ndarray, float]:
         r"VolumeSize\s+(\d+)\s+(\d+)\s+(\d+)", header_text).groups())
     voxel_bits = _get(r"VoxelSize\s+(\d+)", header_text, int)
 
-    # VolumeScale is in cm — convert to mm
+    # VolumeScale is already in mm (Dragonfly-verified: 752 px x 0.00643 mm = 4.84 mm FOV,
+    # true voxel = 6.43 um). The old "x10 cm->mm" was a bug that made everything 10x too big.
     vscale_str = re.search(
         r"VolumeScale\s+([\d.eE+\-]+)", header_text).group(1)
-    voxel_size_mm = float(vscale_str) * 10.0   # cm → mm
+    voxel_size_mm = float(vscale_str) * 1.0
 
     # Field: Scale and Offset for HU conversion
     field_m = re.search(
