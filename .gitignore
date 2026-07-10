@@ -1,5 +1,8 @@
 __pycache__/
 *.pyc
+*.zip
+*.VOX
+*.vox
 
 # Raw uCT scans (.VOX), experiment folders and derived results live in the
 # working tree but are NOT part of the repo — only the pipeline code + atlas.npz
