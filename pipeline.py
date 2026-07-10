@@ -251,16 +251,19 @@ def build_and_serve(slp, cla, kept, peak, a, u, w, vsize, RR, HH, out_dir, port)
 # ---- main --------------------------------------------------------------------
 def main():
     ap = argparse.ArgumentParser(description="Measure ectopic tibial bone growth (SL vs CL).")
-    ap.add_argument("--sl-path", required=True, help="surgical (transplant) .VOX path")
-    ap.add_argument("--cl-path", required=True, help="contralateral (control) .VOX path")
-    ap.add_argument("--disc-radius", type=float, default=1.2, help="disc radius, mm (default 1.2)")
-    ap.add_argument("--disc-height", type=float, default=0.55, help="disc full height, mm (default 0.55)")
-    ap.add_argument("--hu-th", type=float, default=200.0,
+    ap.add_argument("--sl-path", "--sl_path", dest="sl_path", required=True, help="surgical (transplant) .VOX path")
+    ap.add_argument("--cl-path", "--cl_path", dest="cl_path", required=True, help="contralateral (control) .VOX path")
+    ap.add_argument("--disc-radius", "--disc_radius", dest="disc_radius", type=float, default=1.2,
+                    help="disc radius, mm (default 1.2)")
+    ap.add_argument("--disc-height", "--disc_height", dest="disc_height", type=float, default=0.55,
+                    help="disc full height, mm (default 0.55)")
+    ap.add_argument("--hu-th", "--hu_th", dest="hu_th", type=float, default=200.0,
                     help="bone threshold as HU offset above each scan's Otsu level (default 200)")
     ap.add_argument("--visualize", action="store_true", help="serve the WebGL viewer on localhost")
     ap.add_argument("--port", type=int, default=8000, help="localhost port for --visualize (default 8000)")
-    ap.add_argument("--out-dir", default=None, help="viewer output dir (default: ./growth_out)")
-    ap.add_argument("--gt-vox", type=float, default=None, help="optional ground-truth voxel count for a ratio")
+    ap.add_argument("--out-dir", "--out_dir", dest="out_dir", default=None, help="viewer output dir (default: ./growth_out)")
+    ap.add_argument("--gt-vox", "--gt_vox", dest="gt_vox", type=float, default=None,
+                    help="optional ground-truth voxel count for a ratio")
     args = ap.parse_args()
 
     RR = args.disc_radius * STEP        # radius mm -> mesh
